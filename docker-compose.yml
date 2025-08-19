@@ -1,0 +1,166 @@
+version: "3.9"
+
+x-logging: &fluentd-logging
+  driver: fluentd
+  options:
+    fluentd-address: "localhost:24224"
+    tag: "container.{{.Name}}"
+    fluentd-async: "true"
+
+volumes:
+  opensearch-data:
+
+networks:
+  opensearch-net:
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: opensearch
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+      DISABLE_INSTALL_DEMO_CONFIG: "false"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "G7v!xQp2@Ln9"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -s https://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - opensearch-net
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: opensearch-dashboards
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      OPENSEARCH_HOSTS: '["https://opensearch:9200"]'
+      OPENSEARCH_USERNAME: "admin"
+      OPENSEARCH_PASSWORD: "G7v!xQp2@Ln9"
+      OPENSEARCH_SSL_VERIFICATION_MODE: "none"
+    volumes:
+      - ./opensearch_dashboards.yml:/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml:ro
+    ports:
+      - "5601:5601"
+    networks:
+      - opensearch-net
+
+  fluent-bit:
+    image: fluent/fluent-bit:4.0.7
+    container_name: fluent-bit
+    user: root
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    depends_on:
+      - opensearch
+    networks:
+      - opensearch-net
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    container_name: otel-collector
+    command: ["--config", "/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - data-prepper
+    networks:
+      - opensearch-net
+
+  data-prepper:
+    image: opensearchproject/data-prepper:2.8.0
+    container_name: data-prepper
+    volumes:
+      - ./data-prepper/pipelines.yaml:/usr/share/data-prepper/pipelines/pipelines.yaml:ro
+      - ./data-prepper/data-prepper-config.yaml:/usr/share/data-prepper/config/data-prepper-config.yaml:ro
+    ports:
+      - "21890:21890"
+    depends_on:
+      - opensearch
+    networks:
+      - opensearch-net
+
+  service-a:
+    build:
+      context: ./services
+    container_name: service-a
+    environment:
+      - SERVICE_NAME=service-a
+      - PORT=8000
+      - UPSTREAM_URL=http://service-b:8000/work
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=${SERVICE_NAME},service.version=1.0,service.namespace=demo
+      - OTEL_PYTHON_LOG_CORRELATION=true
+
+    ports:
+      - "8000:8000"
+    depends_on:
+      - otel-collector
+      - fluent-bit
+    logging: *fluentd-logging
+    networks:
+      - opensearch-net
+
+  service-b:
+    build:
+      context: ./services
+    container_name: service-b
+    environment:
+      - SERVICE_NAME=service-b
+      - PORT=8000
+      - UPSTREAM_URL=http://service-c:8000/work
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=${SERVICE_NAME},service.version=1.0,service.namespace=demo
+      - OTEL_PYTHON_LOG_CORRELATION=true
+    depends_on:
+      - otel-collector
+      - fluent-bit
+    logging: *fluentd-logging
+    networks:
+      - opensearch-net
+
+  service-c:
+    build:
+      context: ./services
+    container_name: service-c
+    environment:
+      - SERVICE_NAME=service-c
+      - PORT=8000
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=${SERVICE_NAME},service.version=1.0,service.namespace=demo
+      - OTEL_PYTHON_LOG_CORRELATION=true
+    depends_on:
+      - otel-collector
+      - fluent-bit
+    logging: *fluentd-logging
+    networks:
+      - opensearch-net
